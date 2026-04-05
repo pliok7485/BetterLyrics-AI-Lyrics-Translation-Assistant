@@ -7,4 +7,5 @@ python腳本源碼 有需要可以自己修改使用
 
 windows 可以直接使用版本下載
 
-[下載windows可用程式]([https://www.google.com](https://github.com/pliok7485/BetterLyrics-AI-Lyrics-Translation-Assistant/releases/tag/BetterLyrics-AI-Lyrics-Translation-Assistant))
+[下載windows可用程式](https://github.com/pliok7485/BetterLyrics-AI-Lyrics-Translation-Assistant/releases/tag/BetterLyrics-AI-Lyrics-Translation-Assistant)
+
