@@ -9,3 +9,4 @@ windows 可以直接使用版本下載
 
 [下載windows可用程式](https://github.com/pliok7485/BetterLyrics-AI-Lyrics-Translation-Assistant/releases/tag/BetterLyrics-AI-Lyrics-Translation-Assistant)
 
+![image](image/程式介面圖片.png)
