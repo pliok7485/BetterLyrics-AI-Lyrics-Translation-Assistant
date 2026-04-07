@@ -33,10 +33,6 @@ class TranslationServer:
             if not q: return jsonify({"translatedText": ""})
             return jsonify({"translatedText": self.do_translate(q)})
 
-        @self.app.route('/languages', methods=['GET'])
-        def languages():
-            return jsonify([{"code": "zh", "name": "Chinese"}])
-
     def do_translate(self, text):
         if self.mode == "Google":
             return self.mode_backup_google(text)
@@ -45,7 +41,6 @@ class TranslationServer:
         key = self.api_key.strip()
         if not url or not key: return self.mode_backup_google(text)
 
-        # --- DeepL 模式 (DeepL 不支援台灣繁體參數，效果仍可能夾雜簡體) ---
         if "deepl.com" in url.lower():
             try:
                 headers = {"Authorization": f"DeepL-Auth-Key {key}"}
@@ -53,8 +48,6 @@ class TranslationServer:
                 r = requests.post(url, headers=headers, data=payload, timeout=10)
                 return r.json()['translations'][0]['text'] if r.status_code == 200 else self.mode_backup_google(text)
             except: return self.mode_backup_google(text)
-
-        # --- AI 模式 (DeepSeek / GPT): 強化台灣繁體指令 ---
         else:
             target_url = url
             if "chat/completions" not in target_url:
@@ -64,36 +57,20 @@ class TranslationServer:
             
             try:
                 headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-                
-                # 這裡是最核心的指令修改
                 payload = {
                     "model": "deepseek-chat" if "deepseek" in target_url else "gpt-3.5-turbo",
                     "messages": [
                         {
                             "role": "system", 
-                            "content": (
-                                "你是一位專業的歌詞翻譯家，精通台灣繁體中文。請將輸入的歌詞翻譯成「台灣繁體」。\n"
-                                "指令規範：\n"
-                                "1. 嚴禁使用簡體字。\n"
-                                "2. 使用台灣在地慣用語（例如：品質、影片、軟體、訊息）。\n"
-                                "3. 保持歌詞的意境與押韻感。\n"
-                                "4. 直接輸出譯文，不要有任何解釋或贅字。"
-                            )
+                            "content": "你是一位專業的歌詞翻譯家，將歌詞翻譯成「台灣繁體」。嚴禁簡體，使用台灣慣用語。"
                         },
                         {"role": "user", "content": text}
                     ],
-                    "temperature": 0.4 # 稍微提高一點溫度讓歌詞更自然
+                    "temperature": 0.4
                 }
-                
                 r = requests.post(target_url, headers=headers, json=payload, timeout=15)
-                if r.status_code == 200:
-                    return r.json()['choices'][0]['message']['content'].strip()
-                else:
-                    self.log(f"!!! AI 錯誤 ({r.status_code})")
-                    return self.mode_backup_google(text)
-            except Exception as e:
-                self.log(f"!!! AI 連線異常: {str(e)[:50]}")
-                return self.mode_backup_google(text)
+                return r.json()['choices'][0]['message']['content'].strip() if r.status_code == 200 else self.mode_backup_google(text)
+            except: return self.mode_backup_google(text)
 
     def mode_backup_google(self, text):
         try:
@@ -110,12 +87,12 @@ class TranslationServer:
 class AppGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("BetterLyrics 助手 v2.3 (台語化強化版)")
+        self.root.title("BetterLyrics 助手 v2.4")
         self.root.geometry("550x700")
         self.profiles = {}
         self.server_started = False
         
-        ttk.Label(root, text="歌詞中轉伺服器 v2.3", font=('Arial', 12, 'bold')).pack(pady=10)
+        ttk.Label(root, text="歌詞中轉伺服器 v2.4", font=('Arial', 12, 'bold')).pack(pady=10)
         
         manage_frame = ttk.LabelFrame(root, text=" 1. 選擇配置 ")
         manage_frame.pack(fill='x', padx=20, pady=5)
@@ -164,8 +141,10 @@ class AppGUI:
         self.update_ui()
 
     def update_ui(self):
+        """根據模式決定 Entry 是否可編輯"""
         s = 'normal' if self.mode_var.get() == "AI" else 'disabled'
-        self.ent_url.config(state=s); self.ent_key.config(state=s)
+        self.ent_url.config(state=s)
+        self.ent_key.config(state=s)
 
     def load_all_profiles(self):
         if os.path.exists(CONFIG_FILE):
@@ -173,25 +152,47 @@ class AppGUI:
                 self.profiles = json.load(f)
         if not self.profiles:
             self.profiles = {"預設 Google": {"mode": "Google", "url": "", "key": ""}}
-        self.profile_cb['values'] = list(self.profiles.keys()); self.profile_cb.set(list(self.profiles.keys())[0])
+        self.profile_cb['values'] = list(self.profiles.keys())
+        self.profile_cb.set(list(self.profiles.keys())[0])
         self.on_profile_change(None)
 
     def on_profile_change(self, event):
+        """切換配置時的核心修復邏輯"""
         name = self.profile_cb.get()
-        p = self.profiles.get(name, {})
-        self.ent_name.delete(0, tk.END); self.ent_name.insert(0, name)
+        p = self.profiles.get(name)
+        if not p: return
+
+        # 1. 先強行將狀態設為 normal，否則無法填入內容
+        self.ent_url.config(state='normal')
+        self.ent_key.config(state='normal')
+
+        # 2. 清除並填入新值
+        self.ent_name.delete(0, tk.END)
+        self.ent_name.insert(0, name)
+        
         self.mode_var.set(p.get("mode", "Google"))
-        self.ent_url.delete(0, tk.END); self.ent_url.insert(0, p.get("url", ""))
-        self.ent_key.delete(0, tk.END); self.ent_key.insert(0, p.get("key", ""))
+        
+        self.ent_url.delete(0, tk.END)
+        self.ent_url.insert(0, p.get("url", ""))
+        
+        self.ent_key.delete(0, tk.END)
+        self.ent_key.insert(0, p.get("key", ""))
+        
+        # 3. 填完後再根據該配置的 mode 執行 UI 鎖定/解鎖
         self.update_ui()
 
     def save_current_profile(self):
         name = self.ent_name.get().strip()
         if not name: return
-        self.profiles[name] = {"mode": self.mode_var.get(), "url": self.ent_url.get(), "key": self.ent_key.get()}
+        self.profiles[name] = {
+            "mode": self.mode_var.get(), 
+            "url": self.ent_url.get(), 
+            "key": self.ent_key.get()
+        }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(self.profiles, f, ensure_ascii=False)
-        self.profile_cb['values'] = list(self.keys()); self.profile_cb.set(name)
+        self.profile_cb['values'] = list(self.profiles.keys())
+        self.profile_cb.set(name)
         self.server.log(f"配置 '{name}' 已儲存")
 
     def delete_profile(self):
@@ -203,17 +204,21 @@ class AppGUI:
             self.load_all_profiles()
 
     def start_server(self):
-        self.server.mode, self.server.api_key, self.server.api_url = self.mode_var.get(), self.ent_key.get(), self.ent_url.get()
+        self.server.mode = self.mode_var.get()
+        self.server.api_key = self.ent_key.get()
+        self.server.api_url = self.ent_url.get()
         self.server.is_active = True
-        self.btn_start.config(state='disabled'); self.btn_stop.config(state='normal')
+        self.btn_start.config(state='disabled')
+        self.btn_stop.config(state='normal')
         if not self.server_started:
             self.server_started = True
             threading.Thread(target=self.server.run, daemon=True).start()
-        self.server.log(f">>> 伺服器啟動！目前模式: {self.server.mode}")
+        self.server.log(f">>> 伺服器啟動！模式: {self.server.mode}")
 
     def stop_server(self):
         self.server.is_active = False
-        self.btn_start.config(state='normal'); self.btn_stop.config(state='disabled')
+        self.btn_start.config(state='normal')
+        self.btn_stop.config(state='disabled')
         self.server.log(">>> 伺服器已暫停")
 
 if __name__ == '__main__':
