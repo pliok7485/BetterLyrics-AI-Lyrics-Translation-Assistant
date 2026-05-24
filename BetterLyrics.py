@@ -15,7 +15,9 @@ class TranslationServer:
         self.mode = "Google"
         self.api_key = ""
         self.api_url = ""
-        self.is_active = False 
+        self.model_name = "gpt-3.5-turbo"
+        self.system_prompt = "你是一位專業的歌詞翻譯家，將歌詞翻譯成「台灣繁體」。嚴禁簡體，使用台灣慣用語。請嚴格保持輸入的行數和順序，每行一對一翻譯，不要合併或拆分任何行。"
+        self.is_active = False
         self.setup_routes()
 
     def log(self, message):
@@ -37,16 +39,38 @@ class TranslationServer:
         if self.mode == "Google":
             return self.mode_backup_google(text)
         
-        url = self.api_url.strip()
         key = self.api_key.strip()
-        if not url or not key: return self.mode_backup_google(text)
+        if not key: return self.mode_backup_google(text)
+
+        if self.mode == "Gemini":
+            try:
+                model = self.model_name.strip() or "gemini-1.5-flash"
+                url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={key}"
+                payload = {
+                    "contents": [{
+                        "parts": [{"text": self.system_prompt + "\n\n" + text}]
+                    }]
+                }
+                r = requests.post(url, json=payload, timeout=15)
+                if r.status_code == 200:
+                    candidates = r.json().get('candidates', [])
+                    if candidates:
+                        return candidates[0]['content']['parts'][0]['text'].strip()
+                return self.mode_backup_google(text)
+            except:
+                return self.mode_backup_google(text)
+
+        url = self.api_url.strip()
+        if not url: return self.mode_backup_google(text)
 
         if "deepl.com" in url.lower():
             try:
                 headers = {"Authorization": f"DeepL-Auth-Key {key}"}
                 payload = {"text": [text], "target_lang": "ZH"}
                 r = requests.post(url, headers=headers, data=payload, timeout=10)
-                return r.json()['translations'][0]['text'] if r.status_code == 200 else self.mode_backup_google(text)
+                if r.status_code == 200:
+                    return r.json()['translations'][0]['text']
+                return self.mode_backup_google(text)
             except: return self.mode_backup_google(text)
         else:
             target_url = url
@@ -58,18 +82,20 @@ class TranslationServer:
             try:
                 headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
                 payload = {
-                    "model": "deepseek-chat" if "deepseek" in target_url else "gpt-3.5-turbo",
+                    "model": self.model_name,
                     "messages": [
                         {
                             "role": "system", 
-                            "content": "你是一位專業的歌詞翻譯家，將歌詞翻譯成「台灣繁體」。嚴禁簡體，使用台灣慣用語。"
+                            "content": self.system_prompt
                         },
                         {"role": "user", "content": text}
                     ],
                     "temperature": 0.4
                 }
                 r = requests.post(target_url, headers=headers, json=payload, timeout=15)
-                return r.json()['choices'][0]['message']['content'].strip() if r.status_code == 200 else self.mode_backup_google(text)
+                if r.status_code == 200:
+                    return r.json()['choices'][0]['message']['content'].strip()
+                return self.mode_backup_google(text)
             except: return self.mode_backup_google(text)
 
     def mode_backup_google(self, text):
@@ -79,20 +105,102 @@ class TranslationServer:
             return "".join([l[0] for l in r.json()[0] if l and l[0]])
         except: return text
 
+    def test_connection(self):
+        """測試 AI 配置是否有效，回傳 (成功與否, 訊息)"""
+        if self.mode == "Google":
+            return False, "Google 模式無需測試"
+        
+        key = self.api_key.strip()
+        if not key:
+            return False, "API Key 為空"
+
+        if self.mode == "Gemini":
+            try:
+                model = self.model_name.strip() or "gemini-1.5-flash"
+                url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={key}"
+                payload = {
+                    "contents": [{
+                        "parts": [{"text": "Hello"}]
+                    }]
+                }
+                r = requests.post(url, json=payload, timeout=15)
+                if r.status_code == 200:
+                    candidates = r.json().get('candidates', [])
+                    if candidates:
+                        reply = candidates[0]['content']['parts'][0]['text'].strip()
+                        return True, f"✅ Gemini 連線成功！回應：{reply[:50]}"
+                    return True, "✅ Gemini 連線成功（無回應內容）"
+                else:
+                    detail = ""
+                    try:
+                        detail = r.json().get('error', {}).get('message', r.text[:200])
+                    except:
+                        detail = r.text[:200]
+                    return False, f"❌ Gemini 測試失敗 (HTTP {r.status_code})：{detail}"
+            except Exception as e:
+                return False, f"❌ Gemini 連線異常：{str(e)}"
+
+        url = self.api_url.strip()
+        if not url:
+            return False, "API URL 為空"
+        
+        if "deepl.com" in url.lower():
+            try:
+                headers = {"Authorization": f"DeepL-Auth-Key {key}"}
+                payload = {"text": ["Hello"], "target_lang": "ZH"}
+                r = requests.post(url, headers=headers, data=payload, timeout=10)
+                if r.status_code == 200:
+                    return True, f"✅ DeepL 連線成功！回應：{r.json()['translations'][0]['text']}"
+                else:
+                    return False, f"❌ DeepL 測試失敗 (HTTP {r.status_code})：{r.text[:100]}"
+            except Exception as e:
+                return False, f"❌ DeepL 連線異常：{str(e)}"
+        else:
+            target_url = url
+            if "chat/completions" not in target_url:
+                if not target_url.endswith('/'): target_url += '/'
+                if "v1" not in target_url: target_url += "v1/"
+                target_url += "chat/completions"
+            
+            try:
+                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+                payload = {
+                    "model": self.model_name,
+                    "messages": [
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": "Hello"}
+                    ],
+                    "temperature": 0.4,
+                    "max_tokens": 50
+                }
+                r = requests.post(target_url, headers=headers, json=payload, timeout=15)
+                if r.status_code == 200:
+                    reply = r.json()['choices'][0]['message']['content'].strip()
+                    return True, f"✅ AI 連線成功！回應：{reply[:50]}"
+                else:
+                    detail = ""
+                    try:
+                        detail = r.json().get('error', {}).get('message', r.text[:100])
+                    except:
+                        detail = r.text[:100]
+                    return False, f"❌ AI 測試失敗 (HTTP {r.status_code})：{detail}"
+            except Exception as e:
+                return False, f"❌ AI 連線異常：{str(e)}"
+
     def run(self):
         import logging
         logging.getLogger('werkzeug').setLevel(logging.ERROR)
-        self.app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
+        self.app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False, threaded=True)
 
 class AppGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("BetterLyrics 助手 v2.4")
-        self.root.geometry("550x700")
+        self.root.title("BetterLyrics 助手 v2.5")
+        self.root.geometry("550x780")
         self.profiles = {}
         self.server_started = False
         
-        ttk.Label(root, text="歌詞中轉伺服器 v2.4", font=('Arial', 12, 'bold')).pack(pady=10)
+        ttk.Label(root, text="歌詞中轉伺服器 v2.5", font=('Arial', 12, 'bold')).pack(pady=10)
         
         manage_frame = ttk.LabelFrame(root, text=" 1. 選擇配置 ")
         manage_frame.pack(fill='x', padx=20, pady=5)
@@ -114,6 +222,7 @@ class AppGUI:
         m_sub.grid(row=1, column=1, sticky="w")
         ttk.Radiobutton(m_sub, text="Google", variable=self.mode_var, value="Google", command=self.update_ui).pack(side="left")
         ttk.Radiobutton(m_sub, text="AI / DeepL", variable=self.mode_var, value="AI", command=self.update_ui).pack(side="left")
+        ttk.Radiobutton(m_sub, text="Gemini", variable=self.mode_var, value="Gemini", command=self.update_ui).pack(side="left")
         
         ttk.Label(self.edit_frame, text="API URL:").grid(row=2, column=0, padx=5, pady=2, sticky="w")
         self.ent_url = ttk.Entry(self.edit_frame)
@@ -123,8 +232,27 @@ class AppGUI:
         self.ent_key = ttk.Entry(self.edit_frame, show="*")
         self.ent_key.grid(row=3, column=1, padx=5, pady=2, sticky="ew")
         
-        ttk.Button(self.edit_frame, text="儲存配置", command=self.save_current_profile).grid(row=4, column=0, columnspan=2, pady=10)
+        ttk.Label(self.edit_frame, text="AI 模型:").grid(row=4, column=0, padx=5, pady=2, sticky="w")
+        self.ent_model = ttk.Entry(self.edit_frame)
+        self.ent_model.grid(row=4, column=1, padx=5, pady=2, sticky="ew")
+        
+        ttk.Label(self.edit_frame, text="提示詞:").grid(row=5, column=0, padx=5, pady=2, sticky="nw")
+        self.txt_prompt = tk.Text(self.edit_frame, height=4, width=30)
+        self.txt_prompt.grid(row=5, column=1, padx=5, pady=2, sticky="ew")
+        
+        btn_frame = ttk.Frame(self.edit_frame)
+        btn_frame.grid(row=6, column=0, columnspan=2, pady=10)
+        ttk.Button(btn_frame, text="儲存配置", command=self.save_current_profile).pack(side="left", padx=5)
+        self.btn_test = ttk.Button(btn_frame, text="測試連線", command=self.test_ai_config)
+        self.btn_test.pack(side="left", padx=5)
         self.edit_frame.columnconfigure(1, weight=1)
+
+        # 為所有 Entry 和 Text 欄位加上右鍵選單
+        self._add_right_click_menu(self.ent_name)
+        self._add_right_click_menu(self.ent_url)
+        self._add_right_click_menu(self.ent_key)
+        self._add_right_click_menu(self.ent_model)
+        self._add_right_click_menu_text(self.txt_prompt)
 
         self.log_area = scrolledtext.ScrolledText(root, height=12, font=('Consolas', 9))
         self.log_area.pack(fill='both', padx=20, pady=5, expand=True)
@@ -142,9 +270,23 @@ class AppGUI:
 
     def update_ui(self):
         """根據模式決定 Entry 是否可編輯"""
-        s = 'normal' if self.mode_var.get() == "AI" else 'disabled'
-        self.ent_url.config(state=s)
-        self.ent_key.config(state=s)
+        mode = self.mode_var.get()
+        if mode == "Google":
+            s_ai = 'disabled'
+            s_gemini = 'disabled'
+        elif mode == "Gemini":
+            s_ai = 'disabled'
+            s_gemini = 'normal'
+        else:  # AI
+            s_ai = 'normal'
+            s_gemini = 'disabled'
+        
+        # AI 模式下 API URL 和 Key 可編輯；Gemini 模式 Key/模型/提示詞可編輯
+        self.ent_url.config(state=s_ai)
+        self.ent_key.config(state='normal' if mode != "Google" else 'disabled')
+        self.ent_model.config(state='normal' if mode != "Google" else 'disabled')
+        self.txt_prompt.config(state='normal' if mode != "Google" else 'disabled')
+        self.btn_test.config(state='normal' if mode != "Google" else 'disabled')
 
     def load_all_profiles(self):
         if os.path.exists(CONFIG_FILE):
@@ -165,6 +307,8 @@ class AppGUI:
         # 1. 先強行將狀態設為 normal，否則無法填入內容
         self.ent_url.config(state='normal')
         self.ent_key.config(state='normal')
+        self.ent_model.config(state='normal')
+        self.txt_prompt.config(state='normal')
 
         # 2. 清除並填入新值
         self.ent_name.delete(0, tk.END)
@@ -178,6 +322,12 @@ class AppGUI:
         self.ent_key.delete(0, tk.END)
         self.ent_key.insert(0, p.get("key", ""))
         
+        self.ent_model.delete(0, tk.END)
+        self.ent_model.insert(0, p.get("model", "gpt-3.5-turbo"))
+        
+        self.txt_prompt.delete("1.0", tk.END)
+        self.txt_prompt.insert("1.0", p.get("prompt", "你是一位專業的歌詞翻譯家，將歌詞翻譯成「台灣繁體」。嚴禁簡體，使用台灣慣用語。請嚴格保持輸入的行數和順序，每行一對一翻譯，不要合併或拆分任何行。"))
+        
         # 3. 填完後再根據該配置的 mode 執行 UI 鎖定/解鎖
         self.update_ui()
 
@@ -187,7 +337,9 @@ class AppGUI:
         self.profiles[name] = {
             "mode": self.mode_var.get(), 
             "url": self.ent_url.get(), 
-            "key": self.ent_key.get()
+            "key": self.ent_key.get(),
+            "model": self.ent_model.get(),
+            "prompt": self.txt_prompt.get("1.0", tk.END).strip()
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(self.profiles, f, ensure_ascii=False)
@@ -207,6 +359,8 @@ class AppGUI:
         self.server.mode = self.mode_var.get()
         self.server.api_key = self.ent_key.get()
         self.server.api_url = self.ent_url.get()
+        self.server.model_name = self.ent_model.get()
+        self.server.system_prompt = self.txt_prompt.get("1.0", tk.END).strip()
         self.server.is_active = True
         self.btn_start.config(state='disabled')
         self.btn_stop.config(state='normal')
@@ -215,11 +369,101 @@ class AppGUI:
             threading.Thread(target=self.server.run, daemon=True).start()
         self.server.log(f">>> 伺服器啟動！模式: {self.server.mode}")
 
+    def test_ai_config(self):
+        """測試當前 AI 配置是否有效（在背景執行緒執行）"""
+        # 先將 UI 當前值同步到 server 物件
+        self.server.mode = self.mode_var.get()
+        self.server.api_key = self.ent_key.get()
+        self.server.api_url = self.ent_url.get()
+        self.server.model_name = self.ent_model.get()
+        self.server.system_prompt = self.txt_prompt.get("1.0", tk.END).strip()
+        
+        self.server.log("⏳ 正在測試連線，請稍候...")
+        self.btn_test.config(state='disabled', text='測試中...')
+        
+        def _do_test():
+            success, msg = self.server.test_connection()
+            # 回到主執行緒更新 UI
+            self.root.after(0, lambda: self._test_done(success, msg))
+        
+        threading.Thread(target=_do_test, daemon=True).start()
+
+    def _test_done(self, success, msg):
+        """測試完成後的回呼"""
+        self.server.log(msg)
+        self.btn_test.config(state='normal', text='測試連線')
+        # 根據模式重新決定按鈕狀態
+        self.update_ui()
+
     def stop_server(self):
         self.server.is_active = False
         self.btn_start.config(state='normal')
         self.btn_stop.config(state='disabled')
         self.server.log(">>> 伺服器已暫停")
+
+    def _add_right_click_menu(self, entry):
+        """為 ttk.Entry 加上右鍵選單（複製、貼上、清除）"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="複製", command=lambda: self._entry_copy(entry))
+        menu.add_command(label="貼上", command=lambda: self._entry_paste(entry))
+        menu.add_separator()
+        menu.add_command(label="清除", command=lambda: self._entry_clear(entry))
+        entry.bind("<Button-3>", lambda e: self._show_menu(menu, e))
+
+    def _add_right_click_menu_text(self, text_widget):
+        """為 tk.Text 加上右鍵選單（複製、貼上、清除）"""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="複製", command=lambda: self._text_copy(text_widget))
+        menu.add_command(label="貼上", command=lambda: self._text_paste(text_widget))
+        menu.add_separator()
+        menu.add_command(label="清除", command=lambda: self._text_clear(text_widget))
+        text_widget.bind("<Button-3>", lambda e: self._show_menu(menu, e))
+
+    def _show_menu(self, menu, event):
+        """顯示右鍵選單"""
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _entry_copy(self, entry):
+        """複製 Entry 選取文字"""
+        try:
+            self.root.clipboard_clear()
+            text = entry.selection_get()
+            self.root.clipboard_append(text)
+        except tk.TclError:
+            pass
+
+    def _entry_paste(self, entry):
+        """貼上到 Entry"""
+        try:
+            text = self.root.clipboard_get()
+            entry.insert(tk.INSERT, text)
+        except tk.TclError:
+            pass
+
+    def _entry_clear(self, entry):
+        """清除 Entry 內容"""
+        entry.delete(0, tk.END)
+
+    def _text_copy(self, text_widget):
+        """複製 Text 選取文字"""
+        try:
+            self.root.clipboard_clear()
+            text = text_widget.selection_get()
+            self.root.clipboard_append(text)
+        except tk.TclError:
+            pass
+
+    def _text_paste(self, text_widget):
+        """貼上到 Text"""
+        try:
+            text = self.root.clipboard_get()
+            text_widget.insert(tk.INSERT, text)
+        except tk.TclError:
+            pass
+
+    def _text_clear(self, text_widget):
+        """清除 Text 內容"""
+        text_widget.delete("1.0", tk.END)
 
 if __name__ == '__main__':
     root = tk.Tk()
