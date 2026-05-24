@@ -7,6 +7,9 @@ python腳本源碼 有需要可以自己修改使用
 
 windows 可以直接使用版本下載
 
+更新日誌:
+2026.05.24 版本V2.5增加自訂AI模型 測試連線功能
+
 [下載windows可用程式](https://github.com/pliok7485/BetterLyrics-AI-Lyrics-Translation-Assistant/releases)
 
-![image](image/程式介面圖片.png)
+![image](image/程式介面圖片v2.5.png)
