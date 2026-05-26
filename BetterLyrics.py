@@ -2,6 +2,7 @@ import threading
 import requests
 import json
 import os
+import concurrent.futures
 from flask import Flask, request, jsonify
 import tkinter as tk
 from tkinter import scrolledtext, ttk
@@ -18,6 +19,7 @@ class TranslationServer:
         self.model_name = "gpt-3.5-turbo"
         self.system_prompt = "你是一位專業的歌詞翻譯家，將歌詞翻譯成「台灣繁體」。嚴禁簡體，使用台灣慣用語。請嚴格保持輸入的行數和順序，每行一對一翻譯，不要合併或拆分任何行。"
         self.is_active = False
+        self.cache = {}  # 翻譯快取：{ (mode, text): translated_text }
         self.setup_routes()
 
     def log(self, message):
@@ -36,67 +38,146 @@ class TranslationServer:
             return jsonify({"translatedText": self.do_translate(q)})
 
     def do_translate(self, text):
+        # 1. 檢查快取
+        cache_key = (self.mode, self.api_url, self.model_name, text)
+        if cache_key in self.cache:
+            return self.align_lyrics(text, self.cache[cache_key])
+
+        translated = ""
         if self.mode == "Google":
-            return self.mode_backup_google(text)
-        
-        key = self.api_key.strip()
-        if not key: return self.mode_backup_google(text)
-
-        if self.mode == "Gemini":
-            try:
-                model = self.model_name.strip() or "gemini-1.5-flash"
-                url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={key}"
-                payload = {
-                    "contents": [{
-                        "parts": [{"text": self.system_prompt + "\n\n" + text}]
-                    }]
-                }
-                r = requests.post(url, json=payload, timeout=15)
-                if r.status_code == 200:
-                    candidates = r.json().get('candidates', [])
-                    if candidates:
-                        return candidates[0]['content']['parts'][0]['text'].strip()
-                return self.mode_backup_google(text)
-            except:
-                return self.mode_backup_google(text)
-
-        url = self.api_url.strip()
-        if not url: return self.mode_backup_google(text)
-
-        if "deepl.com" in url.lower():
-            try:
-                headers = {"Authorization": f"DeepL-Auth-Key {key}"}
-                payload = {"text": [text], "target_lang": "ZH"}
-                r = requests.post(url, headers=headers, data=payload, timeout=10)
-                if r.status_code == 200:
-                    return r.json()['translations'][0]['text']
-                return self.mode_backup_google(text)
-            except: return self.mode_backup_google(text)
+            translated = self.mode_backup_google(text)
         else:
-            target_url = url
-            if "chat/completions" not in target_url:
-                if not target_url.endswith('/'): target_url += '/'
-                if "v1" not in target_url: target_url += "v1/"
-                target_url += "chat/completions"
-            
-            try:
-                headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-                payload = {
-                    "model": self.model_name,
-                    "messages": [
-                        {
-                            "role": "system", 
-                            "content": self.system_prompt
-                        },
-                        {"role": "user", "content": text}
-                    ],
-                    "temperature": 0.4
-                }
-                r = requests.post(target_url, headers=headers, json=payload, timeout=15)
-                if r.status_code == 200:
-                    return r.json()['choices'][0]['message']['content'].strip()
-                return self.mode_backup_google(text)
-            except: return self.mode_backup_google(text)
+            key = self.api_key.strip()
+            if not key: 
+                translated = self.mode_backup_google(text)
+            elif self.mode == "Gemini":
+                translated = self._chunked_translate(text, key)
+            else:
+                url = self.api_url.strip()
+                if not url:
+                    translated = self.mode_backup_google(text)
+                elif "deepl.com" in url.lower():
+                    # DeepL 本身速度極快，不需要分段
+                    translated = self._do_deepl(text, key, url)
+                else:
+                    # AI 聊天模式採用分段加速
+                    translated = self._chunked_translate(text, key, url)
+        
+        # 2. 存入快取
+        self.cache[cache_key] = translated
+        
+        # 強制進行行數對齊校正
+        return self.align_lyrics(text, translated)
+
+    def _chunked_translate(self, text, key, url=None):
+        """並行分段翻譯優化"""
+        lines = text.split('\n')
+        # 如果行數很少，直接翻譯即可
+        if len(lines) <= 12:
+            if self.mode == "Gemini":
+                return self._do_gemini(text, key)
+            else:
+                return self._do_ai_chat(text, key, url)
+
+        # 超過 12 行則進行分段
+        chunk_size = 12
+        chunks = [lines[i:i + chunk_size] for i in range(0, len(lines), chunk_size)]
+        chunk_texts = ['\n'.join(c) for c in chunks]
+        results = [None] * len(chunks)
+
+        def translate_one_chunk(idx):
+            chunk_text = chunk_texts[idx]
+            if self.mode == "Gemini":
+                results[idx] = self._do_gemini(chunk_text, key)
+            else:
+                results[idx] = self._do_ai_chat(chunk_text, key, url)
+
+        # 使用執行緒池同時發起請求 (最多 5 個並行)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            executor.map(translate_one_chunk, range(len(chunks)))
+
+        # 組合結果
+        return '\n'.join([r for r in results if r is not None])
+
+    def _do_gemini(self, text, key):
+        try:
+            model = self.model_name.strip() or "gemini-1.5-flash"
+            url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={key}"
+            payload = {
+                "contents": [{
+                    "parts": [{"text": self.system_prompt + "\n\n" + text}]
+                }]
+            }
+            r = requests.post(url, json=payload, timeout=15)
+            if r.status_code == 200:
+                candidates = r.json().get('candidates', [])
+                if candidates:
+                    return candidates[0]['content']['parts'][0]['text'].strip()
+            return self.mode_backup_google(text)
+        except:
+            return self.mode_backup_google(text)
+
+    def _do_deepl(self, text, key, url):
+        try:
+            headers = {"Authorization": f"DeepL-Auth-Key {key}"}
+            payload = {"text": [text], "target_lang": "ZH"}
+            r = requests.post(url, headers=headers, data=payload, timeout=10)
+            if r.status_code == 200:
+                return r.json()['translations'][0]['text']
+            return self.mode_backup_google(text)
+        except: return self.mode_backup_google(text)
+
+    def _do_ai_chat(self, text, key, url):
+        target_url = url
+        if "chat/completions" not in target_url:
+            if not target_url.endswith('/'): target_url += '/'
+            if "v1" not in target_url: target_url += "v1/"
+            target_url += "chat/completions"
+        
+        try:
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            payload = {
+                "model": self.model_name,
+                "messages": [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": text}
+                ],
+                "temperature": 0.4
+            }
+            r = requests.post(target_url, headers=headers, json=payload, timeout=15)
+            if r.status_code == 200:
+                return r.json()['choices'][0]['message']['content'].strip()
+            return self.mode_backup_google(text)
+        except: return self.mode_backup_google(text)
+
+    def align_lyrics(self, original_text, translated_text):
+        """校正翻譯結果，確保行數與原文完全一致"""
+        if not original_text: return ""
+        
+        # 使用 split('\n') 保持空行結構
+        orig_lines = original_text.split('\n')
+        # 取得翻譯後的非空行內容
+        trans_lines = [l.strip() for l in translated_text.split('\n') if l.strip()]
+        
+        # 如果行數本來就一樣，且沒有太多異常，直接回傳（優化效能）
+        # 但為了絕對保險，我們還是執行對齊邏輯
+        
+        result = []
+        trans_idx = 0
+        for orig in orig_lines:
+            if not orig.strip():
+                # 原文是空行，則回傳空行
+                result.append("")
+            else:
+                # 原文有內容，填入對應的翻譯內容
+                if trans_idx < len(trans_lines):
+                    result.append(trans_lines[trans_idx])
+                    trans_idx += 1
+                else:
+                    # 如果翻譯用完了，補空（或可補原文，但通常空行對歌詞軟體較好）
+                    result.append("")
+        
+        return "\n".join(result)
 
     def mode_backup_google(self, text):
         try:
@@ -195,12 +276,12 @@ class TranslationServer:
 class AppGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("BetterLyrics 助手 v2.5")
+        self.root.title("BetterLyrics 助手 v2.5.1")
         self.root.geometry("550x780")
         self.profiles = {}
         self.server_started = False
         
-        ttk.Label(root, text="歌詞中轉伺服器 v2.5", font=('Arial', 12, 'bold')).pack(pady=10)
+        ttk.Label(root, text="歌詞中轉伺服器 v2.5.1", font=('Arial', 12, 'bold')).pack(pady=10)
         
         manage_frame = ttk.LabelFrame(root, text=" 1. 選擇配置 ")
         manage_frame.pack(fill='x', padx=20, pady=5)
