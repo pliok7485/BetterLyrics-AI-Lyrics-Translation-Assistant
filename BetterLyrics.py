@@ -17,7 +17,7 @@ class TranslationServer:
         self.api_key = ""
         self.api_url = ""
         self.model_name = "gpt-3.5-turbo"
-        self.system_prompt = "你是一位專業的歌詞翻譯家，將歌詞翻譯成「台灣繁體」。嚴禁簡體，使用台灣慣用語。請嚴格保持輸入的行數和順序，每行一對一翻譯，不要合併或拆分任何行。"
+        self.system_prompt = "你是一位專業的歌詞翻譯家，將歌詞翻譯成「台灣繁體」。嚴禁簡體，使用台灣慣用語。\n\n【嚴格規則】\n1. 行數必須完全一致：輸入有 N 行，輸出也必須有 N 行。\n2. 第一行翻譯對應第一行，第二行對應第二行，依此類推。\n3. 空行保持為空行。\n4. 每行一對一翻譯，絕對不要合併或拆分任何行。\n5. 不要添加任何說明文字，只輸出翻譯結果。"
         self.is_active = False
         self.cache = {}  # 翻譯快取：{ (mode, text): translated_text }
         self.setup_routes()
@@ -38,7 +38,10 @@ class TranslationServer:
             return jsonify({"translatedText": self.do_translate(q)})
 
     def do_translate(self, text):
-        # 1. 檢查快取
+        # 1. 記錄原文行數結構
+        orig_line_count = len(text.split('\n'))
+        
+        # 2. 檢查快取
         cache_key = (self.mode, self.api_url, self.model_name, text)
         if cache_key in self.cache:
             return self.align_lyrics(text, self.cache[cache_key])
@@ -63,14 +66,14 @@ class TranslationServer:
                     # AI 聊天模式採用分段加速
                     translated = self._chunked_translate(text, key, url)
         
-        # 2. 存入快取
+        # 3. 存入快取
         self.cache[cache_key] = translated
         
-        # 強制進行行數對齊校正
+        # 4. 強制進行行數對齊校正（嚴格保持行數一致）
         return self.align_lyrics(text, translated)
 
     def _chunked_translate(self, text, key, url=None):
-        """並行分段翻譯優化"""
+        """並行分段翻譯優化，保留完整行數結構"""
         lines = text.split('\n')
         # 如果行數很少，直接翻譯即可
         if len(lines) <= 12:
@@ -87,17 +90,30 @@ class TranslationServer:
 
         def translate_one_chunk(idx):
             chunk_text = chunk_texts[idx]
+            chunk_lines = chunk_text.split('\n')
             if self.mode == "Gemini":
-                results[idx] = self._do_gemini(chunk_text, key)
+                translated = self._do_gemini(chunk_text, key)
             else:
-                results[idx] = self._do_ai_chat(chunk_text, key, url)
+                translated = self._do_ai_chat(chunk_text, key, url)
+            # 確保 chunk 的行數一致
+            if translated and len(translated.split('\n')) == len(chunk_lines):
+                results[idx] = translated
+            else:
+                # chunk 失敗或行數不匹配 → 用每行的 Google 備援（保留行數）
+                fallback_lines = []
+                for cl in chunk_lines:
+                    if cl.strip():
+                        fallback_lines.append(self.mode_backup_google(cl))
+                    else:
+                        fallback_lines.append("")
+                results[idx] = '\n'.join(fallback_lines)
 
         # 使用執行緒池同時發起請求 (最多 5 個並行)
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             executor.map(translate_one_chunk, range(len(chunks)))
 
-        # 組合結果
-        return '\n'.join([r for r in results if r is not None])
+        # 組合結果（所有 chunk 都有結果，不會有 None）
+        return '\n'.join(results)
 
     def _do_gemini(self, text, key):
         try:
@@ -151,39 +167,53 @@ class TranslationServer:
         except: return self.mode_backup_google(text)
 
     def align_lyrics(self, original_text, translated_text):
-        """校正翻譯結果，確保行數與原文完全一致"""
+        """
+        嚴格對齊歌詞行數：強制讓回傳的行數與原文完全一致。
+        任何行數不匹配都會被修正，確保每一行原文對應一行翻譯。
+        """
         if not original_text: return ""
         
-        # 使用 split('\n') 保持空行結構
+        # 將原文和譯文都按行拆分（保留空行）
         orig_lines = original_text.split('\n')
-        # 取得翻譯後的非空行內容
-        trans_lines = [l.strip() for l in translated_text.split('\n') if l.strip()]
+        trans_lines = translated_text.split('\n')
         
-        # 如果行數本來就一樣，且沒有太多異常，直接回傳（優化效能）
-        # 但為了絕對保險，我們還是執行對齊邏輯
+        # 確保翻譯行數與原文相同：太多就截斷，太少就補空行
+        if len(trans_lines) > len(orig_lines):
+            trans_lines = trans_lines[:len(orig_lines)]
+        elif len(trans_lines) < len(orig_lines):
+            trans_lines.extend([""] * (len(orig_lines) - len(trans_lines)))
         
+        # 逐行對應，原文空行則保持空行
         result = []
-        trans_idx = 0
-        for orig in orig_lines:
-            if not orig.strip():
-                # 原文是空行，則回傳空行
+        for i in range(len(orig_lines)):
+            if not orig_lines[i].strip():
+                # 原文是空行 → 輸出空行
                 result.append("")
             else:
-                # 原文有內容，填入對應的翻譯內容
-                if trans_idx < len(trans_lines):
-                    result.append(trans_lines[trans_idx])
-                    trans_idx += 1
-                else:
-                    # 如果翻譯用完了，補空（或可補原文，但通常空行對歌詞軟體較好）
-                    result.append("")
+                # 原文有內容 → 輸出對應行的翻譯（或空白）
+                line = trans_lines[i].strip() if i < len(trans_lines) else ""
+                result.append(line)
         
         return "\n".join(result)
 
     def mode_backup_google(self, text):
+        """逐行翻譯，嚴格保留換行結構"""
         try:
-            url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-TW&dt=t&q={text}"
-            r = requests.get(url, timeout=5)
-            return "".join([l[0] for l in r.json()[0] if l and l[0]])
+            lines = text.split('\n')
+            result_lines = []
+            for line in lines:
+                if line.strip():
+                    url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-TW&dt=t&q={line}"
+                    r = requests.get(url, timeout=5)
+                    parts = r.json()[0]
+                    translated = ""
+                    for part in parts:
+                        if part and part[0]:
+                            translated += part[0]
+                    result_lines.append(translated.strip())
+                else:
+                    result_lines.append("")
+            return "\n".join(result_lines)
         except: return text
 
     def test_connection(self):
